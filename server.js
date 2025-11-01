@@ -77,17 +77,16 @@ passport.use('42', new OAuth2Strategy({
       const campusId = userData.campus_users?.[0]?.campus_id || null;
 
       // Insert or update user
-      const stmt = db.prepare(`
+      await dbRun(`
         INSERT INTO users (intra_id, email, access_token, campus_id)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(intra_id) DO UPDATE SET
           email = excluded.email,
           access_token = excluded.access_token,
           campus_id = excluded.campus_id
-      `);
-      stmt.run(intraId, email, accessToken, campusId);
+      `, [intraId, email, accessToken, campusId]);
 
-      const user = db.prepare('SELECT * FROM users WHERE intra_id = ?').get(intraId);
+      const user = await dbGet('SELECT * FROM users WHERE intra_id = ?', [intraId]);
       
       // Send notification email to host about new user registration
       try {
@@ -116,9 +115,13 @@ passport.use('42', new OAuth2Strategy({
 ));
 
 passport.serializeUser((user, done) => done(null, user.id));
-passport.deserializeUser((id, done) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
-  done(null, user);
+passport.deserializeUser(async (id, done) => {
+  try {
+    const user = await dbGet('SELECT * FROM users WHERE id = ?', [id]);
+    done(null, user);
+  } catch (error) {
+    done(error);
+  }
 });
 
 // Email transporter
@@ -148,30 +151,41 @@ app.get('/auth/logout', (req, res) => {
   req.logout(() => res.redirect('/'));
 });
 
-app.get('/api/user', isAuthenticated, (req, res) => {
-  const keywords = db.prepare('SELECT * FROM keywords WHERE user_id = ?').all(req.user.id);
-  res.json({
-    email: req.user.email,
-    keywords: keywords.map(k => ({ id: k.id, keyword: k.keyword }))
-  });
+app.get('/api/user', isAuthenticated, async (req, res) => {
+  try {
+    const keywords = await dbAll('SELECT * FROM keywords WHERE user_id = ?', [req.user.id]);
+    res.json({
+      email: req.user.email,
+      keywords: keywords.map(k => ({ id: k.id, keyword: k.keyword }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
-app.post('/api/keywords', isAuthenticated, (req, res) => {
+app.post('/api/keywords', isAuthenticated, async (req, res) => {
   const { keyword } = req.body;
   if (!keyword || keyword.trim().length === 0) {
     return res.status(400).json({ error: 'Keyword cannot be empty' });
   }
 
-  const stmt = db.prepare('INSERT INTO keywords (user_id, keyword) VALUES (?, ?)');
-  const result = stmt.run(req.user.id, keyword.trim().toLowerCase());
-  
-  res.json({ id: result.lastInsertRowid, keyword: keyword.trim().toLowerCase() });
+  try {
+    const result = await dbRun('INSERT INTO keywords (user_id, keyword) VALUES (?, ?)', 
+      [req.user.id, keyword.trim().toLowerCase()]);
+    res.json({ id: result.lastID, keyword: keyword.trim().toLowerCase() });
+  } catch (error) {
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
-app.delete('/api/keywords/:id', isAuthenticated, (req, res) => {
-  const stmt = db.prepare('DELETE FROM keywords WHERE id = ? AND user_id = ?');
-  stmt.run(req.params.id, req.user.id);
-  res.json({ success: true });
+app.delete('/api/keywords/:id', isAuthenticated, async (req, res) => {
+  try {
+    await dbRun('DELETE FROM keywords WHERE id = ? AND user_id = ?', 
+      [req.params.id, req.user.id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // Event checking function
@@ -180,7 +194,7 @@ async function checkForNewEvents() {
   
   try {
     // Get a valid access token from any user
-    const user = db.prepare('SELECT access_token FROM users LIMIT 1').get();
+    const user = await dbGet('SELECT access_token FROM users LIMIT 1');
     if (!user) {
       console.log('No users registered yet');
       return;
@@ -204,26 +218,17 @@ async function checkForNewEvents() {
 
     for (const event of events) {
       // Check if event already processed
-      const processed = db.prepare('SELECT 1 FROM processed_events WHERE event_id = ?').get(event.id);
+      const processed = await dbGet('SELECT 1 FROM processed_events WHERE event_id = ?', [event.id]);
       if (processed) continue;
 
       // Mark as processed
-      db.prepare('INSERT INTO processed_events (event_id) VALUES (?)').run(event.id);
+      await dbRun('INSERT INTO processed_events (event_id) VALUES (?)', [event.id]);
 
       const eventText = `${event.name} ${event.description || ''}`.toLowerCase();
       const eventCampusId = event.campus_ids?.[0] || null;
 
-      // Find all users with their keywords who match this event's campus
-      const matchingUsers = db.prepare(`
-        SELECT DISTINCT u.id, u.email, u.campus_id
-        FROM users u
-        JOIN keywords k ON u.id = k.user_id
-        WHERE k.keyword = ?
-        AND (u.campus_id = ? OR ? IS NULL)
-      `);
-
       // Get all keywords to check against this event
-      const allKeywords = db.prepare('SELECT DISTINCT keyword FROM keywords').all();
+      const allKeywords = await dbAll('SELECT DISTINCT keyword FROM keywords');
       
       // Track which users to notify (user_id -> list of matched keywords)
       const usersToNotify = new Map();
@@ -232,7 +237,13 @@ async function checkForNewEvents() {
         // Check if keyword matches the event text (case-insensitive partial match)
         if (eventText.includes(keyword.toLowerCase())) {
           // Find all users with this keyword and matching campus
-          const users = matchingUsers.all(keyword, eventCampusId, eventCampusId);
+          const users = await dbAll(`
+            SELECT DISTINCT u.id, u.email, u.campus_id
+            FROM users u
+            JOIN keywords k ON u.id = k.user_id
+            WHERE k.keyword = ?
+            AND (u.campus_id = ? OR ? IS NULL)
+          `, [keyword, eventCampusId, eventCampusId]);
           
           for (const user of users) {
             if (!usersToNotify.has(user.id)) {
