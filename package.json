@@ -1,0 +1,27 @@
+{
+  "name": "42-event-notifier",
+  "version": "1.0.0",
+  "description": "42 Intra event notification system",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "express-session": "^1.18.1",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^7.0.10",
+    "passport": "^0.7.0",
+    "passport-oauth2": "^1.8.0",
+    "better-sqlite3": "^12.4.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
