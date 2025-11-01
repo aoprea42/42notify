@@ -8,35 +8,64 @@ const fs = require('fs');
 const path = require('path');
 const cron = require('node-cron');
 const nodemailer = require('nodemailer');
-const Database = require('better-sqlite3');
+const initSqlJs = require('sql.js');
 const axios = require('axios');
 
 const app = express();
-const db = new Database('data.db');
+let db;
 
-// Initialize database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    intra_id INTEGER UNIQUE NOT NULL,
-    email TEXT NOT NULL,
-    access_token TEXT,
-    campus_id INTEGER,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+// Initialize SQL.js database
+async function initDatabase() {
+  const SQL = await initSqlJs();
+  
+  // Try to load existing database
+  let buffer;
+  try {
+    buffer = fs.readFileSync('data.db');
+  } catch (err) {
+    // Database doesn't exist yet
+    buffer = null;
+  }
+  
+  db = new SQL.Database(buffer);
+  
+  // Create tables
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      intra_id INTEGER UNIQUE NOT NULL,
+      email TEXT NOT NULL,
+      access_token TEXT,
+      campus_id INTEGER,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 
-  CREATE TABLE IF NOT EXISTS keywords (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    keyword TEXT NOT NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
+  db.run(`
+    CREATE TABLE IF NOT EXISTS keywords (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      keyword TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
 
-  CREATE TABLE IF NOT EXISTS processed_events (
-    event_id INTEGER PRIMARY KEY,
-    processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS processed_events (
+      event_id INTEGER PRIMARY KEY,
+      processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  
+  // Save database periodically
+  setInterval(saveDatabase, 5000);
+}
+
+function saveDatabase() {
+  const data = db.export();
+  const buffer = Buffer.from(data);
+  fs.writeFileSync('data.db', buffer);
+}
 
 // Middleware
 app.use(express.json());
@@ -47,7 +76,7 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: { 
-    secure: process.env.NODE_ENV === 'production', // only require HTTPS in production
+    secure: process.env.NODE_ENV === 'production',
     httpOnly: true, 
     maxAge: 24 * 60 * 60 * 1000 
   }
