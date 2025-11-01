@@ -77,7 +77,7 @@ passport.use('42', new OAuth2Strategy({
       const campusId = userData.campus_users?.[0]?.campus_id || null;
 
       // Insert or update user
-      await dbRun(`
+      db.run(`
         INSERT INTO users (intra_id, email, access_token, campus_id)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(intra_id) DO UPDATE SET
@@ -85,8 +85,17 @@ passport.use('42', new OAuth2Strategy({
           access_token = excluded.access_token,
           campus_id = excluded.campus_id
       `, [intraId, email, accessToken, campusId]);
+      
+      saveDatabase();
 
-      const user = await dbGet('SELECT * FROM users WHERE intra_id = ?', [intraId]);
+      const result = db.exec('SELECT * FROM users WHERE intra_id = ?', [intraId]);
+      const user = result[0] ? {
+        id: result[0].values[0][0],
+        intra_id: result[0].values[0][1],
+        email: result[0].values[0][2],
+        access_token: result[0].values[0][3],
+        campus_id: result[0].values[0][4]
+      } : null;
       
       // Send notification email to host about new user registration
       try {
@@ -115,10 +124,21 @@ passport.use('42', new OAuth2Strategy({
 ));
 
 passport.serializeUser((user, done) => done(null, user.id));
-passport.deserializeUser(async (id, done) => {
+passport.deserializeUser((id, done) => {
   try {
-    const user = await dbGet('SELECT * FROM users WHERE id = ?', [id]);
-    done(null, user);
+    const result = db.exec('SELECT * FROM users WHERE id = ?', [id]);
+    if (result[0]) {
+      const user = {
+        id: result[0].values[0][0],
+        intra_id: result[0].values[0][1],
+        email: result[0].values[0][2],
+        access_token: result[0].values[0][3],
+        campus_id: result[0].values[0][4]
+      };
+      done(null, user);
+    } else {
+      done(null, null);
+    }
   } catch (error) {
     done(error);
   }
@@ -151,37 +171,48 @@ app.get('/auth/logout', (req, res) => {
   req.logout(() => res.redirect('/'));
 });
 
-app.get('/api/user', isAuthenticated, async (req, res) => {
+app.get('/api/user', isAuthenticated, (req, res) => {
   try {
-    const keywords = await dbAll('SELECT * FROM keywords WHERE user_id = ?', [req.user.id]);
+    const result = db.exec('SELECT * FROM keywords WHERE user_id = ?', [req.user.id]);
+    const keywords = result[0] ? result[0].values.map(row => ({
+      id: row[0],
+      keyword: row[2]
+    })) : [];
+    
     res.json({
       email: req.user.email,
-      keywords: keywords.map(k => ({ id: k.id, keyword: k.keyword }))
+      keywords
     });
   } catch (error) {
     res.status(500).json({ error: 'Database error' });
   }
 });
 
-app.post('/api/keywords', isAuthenticated, async (req, res) => {
+app.post('/api/keywords', isAuthenticated, (req, res) => {
   const { keyword } = req.body;
   if (!keyword || keyword.trim().length === 0) {
     return res.status(400).json({ error: 'Keyword cannot be empty' });
   }
 
   try {
-    const result = await dbRun('INSERT INTO keywords (user_id, keyword) VALUES (?, ?)', 
+    db.run('INSERT INTO keywords (user_id, keyword) VALUES (?, ?)', 
       [req.user.id, keyword.trim().toLowerCase()]);
-    res.json({ id: result.lastID, keyword: keyword.trim().toLowerCase() });
+    saveDatabase();
+    
+    const result = db.exec('SELECT last_insert_rowid()');
+    const id = result[0].values[0][0];
+    
+    res.json({ id, keyword: keyword.trim().toLowerCase() });
   } catch (error) {
     res.status(500).json({ error: 'Database error' });
   }
 });
 
-app.delete('/api/keywords/:id', isAuthenticated, async (req, res) => {
+app.delete('/api/keywords/:id', isAuthenticated, (req, res) => {
   try {
-    await dbRun('DELETE FROM keywords WHERE id = ? AND user_id = ?', 
+    db.run('DELETE FROM keywords WHERE id = ? AND user_id = ?', 
       [req.params.id, req.user.id]);
+    saveDatabase();
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Database error' });
@@ -194,21 +225,19 @@ async function checkForNewEvents() {
   
   try {
     // Get a valid access token from any user
-    const user = await dbGet('SELECT access_token FROM users LIMIT 1');
-    if (!user) {
+    const userResult = db.exec('SELECT access_token FROM users LIMIT 1');
+    if (!userResult[0]) {
       console.log('No users registered yet');
       return;
     }
+    const accessToken = userResult[0].values[0][0];
 
     // Fetch recent events from 42 API
-    const now = new Date();
-    const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-    
     const response = await axios.get('https://api.intra.42.fr/v2/events', {
-      headers: { Authorization: `Bearer ${user.access_token}` },
+      headers: { Authorization: `Bearer ${accessToken}` },
       params: {
-        'filter[campus_id]': '', // Remove campus filter to get all events
-        'filter[future]': true,   // Only future events
+        'filter[campus_id]': '',
+        'filter[future]': true,
         'page[size]': 100,
         'page[number]': 1
       }
@@ -218,26 +247,28 @@ async function checkForNewEvents() {
 
     for (const event of events) {
       // Check if event already processed
-      const processed = await dbGet('SELECT 1 FROM processed_events WHERE event_id = ?', [event.id]);
-      if (processed) continue;
+      const processedResult = db.exec('SELECT 1 FROM processed_events WHERE event_id = ?', [event.id]);
+      if (processedResult[0]) continue;
 
       // Mark as processed
-      await dbRun('INSERT INTO processed_events (event_id) VALUES (?)', [event.id]);
+      db.run('INSERT INTO processed_events (event_id) VALUES (?)', [event.id]);
+      saveDatabase();
 
       const eventText = `${event.name} ${event.description || ''}`.toLowerCase();
       const eventCampusId = event.campus_ids?.[0] || null;
 
-      // Get all keywords to check against this event
-      const allKeywords = await dbAll('SELECT DISTINCT keyword FROM keywords');
+      // Get all keywords
+      const keywordsResult = db.exec('SELECT DISTINCT keyword FROM keywords');
+      const allKeywords = keywordsResult[0] ? keywordsResult[0].values.map(row => row[0]) : [];
       
-      // Track which users to notify (user_id -> list of matched keywords)
+      // Track which users to notify
       const usersToNotify = new Map();
 
-      for (const { keyword } of allKeywords) {
-        // Check if keyword matches the event text (case-insensitive partial match)
+      for (const keyword of allKeywords) {
+        // Check if keyword matches the event text
         if (eventText.includes(keyword.toLowerCase())) {
           // Find all users with this keyword and matching campus
-          const users = await dbAll(`
+          const usersResult = db.exec(`
             SELECT DISTINCT u.id, u.email, u.campus_id
             FROM users u
             JOIN keywords k ON u.id = k.user_id
@@ -245,14 +276,19 @@ async function checkForNewEvents() {
             AND (u.campus_id = ? OR ? IS NULL)
           `, [keyword, eventCampusId, eventCampusId]);
           
-          for (const user of users) {
-            if (!usersToNotify.has(user.id)) {
-              usersToNotify.set(user.id, {
-                email: user.email,
-                keywords: []
-              });
+          if (usersResult[0]) {
+            for (const row of usersResult[0].values) {
+              const userId = row[0];
+              const userEmail = row[1];
+              
+              if (!usersToNotify.has(userId)) {
+                usersToNotify.set(userId, {
+                  email: userEmail,
+                  keywords: []
+                });
+              }
+              usersToNotify.get(userId).keywords.push(keyword);
             }
-            usersToNotify.get(user.id).keywords.push(keyword);
           }
         }
       }
@@ -302,21 +338,23 @@ app.get('/dashboard', isAuthenticated, (req, res) => {
 // Start server (HTTP for development, HTTPS for production)
 const PORT = process.env.PORT || 8000;
 
-if (process.env.NODE_ENV === 'production') {
-  const httpsOptions = {
-    key: fs.readFileSync(process.env.SSL_KEY_PATH || './cert/privkey.pem'),
-    cert: fs.readFileSync(process.env.SSL_CERT_PATH || './cert/fullchain.pem')
-  };
-  
-  https.createServer(httpsOptions, app).listen(PORT, () => {
-    console.log(`Server running on https://localhost:${PORT}`);
-    console.log('Event checking scheduled every 10 seconds');
-  });
-} else {
-  // Development mode - use HTTP
-  app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-    console.log('Event checking scheduled every 10 seconds');
-    console.log('Running in development mode (HTTP)');
-  });
-}
+initDatabase().then(() => {
+  if (process.env.NODE_ENV === 'production') {
+    const httpsOptions = {
+      key: fs.readFileSync(process.env.SSL_KEY_PATH || './cert/privkey.pem'),
+      cert: fs.readFileSync(process.env.SSL_CERT_PATH || './cert/fullchain.pem')
+    };
+    
+    https.createServer(httpsOptions, app).listen(PORT, () => {
+      console.log(`Server running on https://localhost:${PORT}`);
+      console.log('Event checking scheduled every 10 seconds');
+    });
+  } else {
+    // Development mode - use HTTP
+    app.listen(PORT, () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+      console.log('Event checking scheduled every 10 seconds');
+      console.log('Running in development mode (HTTP)');
+    });
+  }
+});
